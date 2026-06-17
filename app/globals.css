@@ -1,0 +1,101 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  --pf-violet: #6d28d9;
+  --pf-cyan: #06b6d4;
+}
+
+* {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+html,
+body {
+  background-color: #000000;
+  color: #ffffff;
+  margin: 0;
+  padding: 0;
+  overflow-x: hidden;
+}
+
+body {
+  min-height: 100vh;
+}
+
+/* Selection */
+::selection {
+  background: rgba(109, 40, 217, 0.4);
+  color: #ffffff;
+}
+
+/* Brutalist thin scrollbar */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: #000000;
+}
+::-webkit-scrollbar-thumb {
+  background: #1a1a1a;
+  border: 1px solid #2a2a2a;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #2a2a2a;
+}
+
+@layer utilities {
+  /* Sharp, thin grid background overlay */
+  .pf-grid {
+    background-image:
+      linear-gradient(to right, rgba(255, 255, 255, 0.045) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+    background-size: 64px 64px;
+  }
+
+  /* Gradient text for accent words */
+  .pf-text-gradient {
+    background: linear-gradient(90deg, #ffffff 0%, #c4b5fd 45%, #67e8f9 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+  }
+
+  /* Glow for the primary CTA */
+  .pf-glow-violet {
+    box-shadow:
+      0 0 0 1px rgba(167, 139, 250, 0.35),
+      0 8px 40px -8px rgba(109, 40, 217, 0.8),
+      0 0 60px -20px rgba(109, 40, 217, 0.9);
+  }
+
+  .pf-glow-cyan {
+    box-shadow:
+      0 0 0 1px rgba(34, 211, 238, 0.3),
+      0 0 50px -16px rgba(6, 182, 212, 0.7);
+  }
+
+  .pf-divider {
+    border-color: rgba(255, 255, 255, 0.1);
+  }
+
+  /* Marquee track must not wrap */
+  .pf-marquee-track {
+    white-space: nowrap;
+    will-change: transform;
+  }
+
+  .pf-no-tap {
+    -webkit-tap-highlight-color: transparent;
+  }
+}

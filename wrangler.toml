@@ -1,0 +1,22 @@
+# Cloudflare Workers deployment config for the ProxyFlow AI Edge Proxy Engine.
+# Deploy:  npx wrangler deploy
+name = "proxyflow-edge"
+main = "proxy.ts"
+compatibility_date = "2024-11-27"
+workers_dev = true
+
+# Route the production hostname through the worker (configure your zone first):
+# [[routes]]
+# pattern = "api.proxyflow.ai/v1/p/*"
+# zone_name = "proxyflow.ai"
+
+# Upstream provider keys can be supplied per-request (Authorization / x-api-key)
+# or bound here as fallback secrets:
+#   npx wrangler secret put OPENAI_API_KEY
+#   npx wrangler secret put ANTHROPIC_API_KEY
+#
+# [vars]
+# PROXYFLOW_ALLOWED_CLIENTS = "client-a,client-b"
+
+[observability]
+enabled = true

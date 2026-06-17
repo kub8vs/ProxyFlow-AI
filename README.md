@@ -36,6 +36,17 @@ violet/cyan atmospheric gradients and sharp thin grid dividers.
    counters (dollars saved, requests routed, active connections, loops broken).
 9. **Two-step "Fit Check" modal** — triggered by any CTA; qualifies high-spend
    clients for instant deployment, routes low-spend to a high-end waitlist.
+10. **Financial ROI Audit calculator** — three live sliders (monthly spend,
+    simple-traffic %, active agents) drive an animated "Guaranteed Annual
+    Restored Capital" metric; the capture CTA opens the Fit Check modal
+    pre-filled with the computed metrics.
+11. **Enterprise subscription tiers** — Pro ($79) / Scale ($299) / Enterprise
+    (from $1,499). Pro & Scale open a mock Stripe checkout overlay that
+    activates the user as `ACTIVE_TENANT` (persisted + a layout-wide status
+    badge, with the minted tenant endpoint); Enterprise fires the Fit Check.
+
+The tier request limits in the pricing matrix mirror the edge engine's
+enforced per-tenant limits exactly (50k / 500k / unlimited).
 
 ### Run locally
 
@@ -55,21 +66,39 @@ npm run start
 
 ## 2. The Edge Proxy Engine (`proxy.ts`)
 
-A complete Cloudflare Worker implementing the three core capabilities:
+A complete Cloudflare Worker acting as a secure **multi-tenant SaaS billing
+gateway** in front of the LLM providers.
 
-### a. SSE streaming passthrough (zero added latency)
+### a. Multi-tenant routing + billing limits
+Requests arrive at `/v1/proxy/:tenantId/chat/completions` (legacy
+`/v1/p/:tenantId/...` is aliased). The `:tenantId` is resolved against a fast
+active-tenant registry — **Upstash Redis (REST)** in production, with a seeded
+in-memory fallback for local/dev. Unknown or non-`ACTIVE_TENANT` tenants are
+intercepted with `402 Payment Required`; tenants over their tier's monthly
+volume get `429 Tier Limit Exhausted` — both **before** any upstream cost. Tier
+limits (`pro` 50k · `scale` 500k · `enterprise` unlimited) mirror the pricing.
+
+Seeded dev tenants (in-memory fallback): `demo-pro`, `acme-scale`,
+`globex-enterprise` (active), `past-due-inc` (→ 402), `maxed-pro` (→ 429).
+
+### b. Async DB instrumentation (zero lag)
+On a successful active-tenant request, usage metering **and** analytics
+telemetry are fired through `ctx.waitUntil()` — the transactional writes never
+add a millisecond to the user's token stream.
+
+### c. SSE streaming passthrough (zero added latency)
 Upstream Server-Sent Events are piped through a zero-buffer `TransformStream`;
 every token is enqueued the instant it arrives, so the proxy injects no
 measurable latency. Post-stream telemetry ships via `ctx.waitUntil`.
 
-### b. Agent Loop Breaker (cryptographic, sliding-window, < 100ms)
+### d. Agent Loop Breaker (cryptographic, sliding-window, < 100ms)
 Each payload is SHA-256 hashed. A per-client sliding window compares consecutive
 payloads; identical payloads exceeding the threshold trip the breaker and return
 `429` **before** the request reaches the upstream — stopping infinite-loop spend
 in single-digit milliseconds. Swap the in-isolate store for a Durable Object for
 global consistency; the detection logic is unchanged.
 
-### c. Model intent header rewriting
+### e. Model intent header rewriting
 A sub-millisecond intent classifier inspects the payload. Low-stakes work is
 down-routed to a cheaper sub-model (`gpt-4o-mini` for OpenAI,
 `claude-haiku-4-5` for Anthropic), the body `model` is rewritten, and the
@@ -79,30 +108,46 @@ correct upstream auth + version headers (`Authorization: Bearer` vs
 ### Usage
 
 ```bash
-# Point your SDK's base URL at your proxy endpoint:
-#   https://api.proxyflow.ai/v1/p/<client-id>/chat/completions   (OpenAI)
-#   https://api.proxyflow.ai/v1/p/<client-id>/messages           (Anthropic)
+# Point your SDK's base URL at your tenant proxy endpoint:
+#   https://api.proxyflow.ai/v1/proxy/<tenant-id>/chat/completions   (OpenAI)
+#   https://api.proxyflow.ai/v1/proxy/<tenant-id>/messages           (Anthropic)
 
-curl https://api.proxyflow.ai/v1/p/demo-client/chat/completions \
+curl https://api.proxyflow.ai/v1/proxy/demo-pro/chat/completions \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -H "content-type: application/json" \
   -d '{ "model": "gpt-4o", "stream": true,
         "messages": [{ "role": "user", "content": "Classify: positive or negative? I love this." }] }'
-# → ProxyFlow down-routes this low-stakes classification to gpt-4o-mini.
+# → ProxyFlow validates the tenant + limit, then down-routes this low-stakes
+#   classification to gpt-4o-mini.
 ```
 
-Response headers expose every decision: `x-proxyflow-routed`,
-`x-proxyflow-original-model`, `x-proxyflow-routed-model`, `x-proxyflow-intent`,
-`x-proxyflow-loop-breaker`, `x-proxyflow-decision-ms`.
+Response headers expose every decision: `x-proxyflow-tenant`,
+`x-proxyflow-tier`, `x-proxyflow-usage`, `x-proxyflow-limit`,
+`x-proxyflow-remaining`, `x-proxyflow-routed`, `x-proxyflow-original-model`,
+`x-proxyflow-routed-model`, `x-proxyflow-intent`, `x-proxyflow-loop-breaker`,
+`x-proxyflow-decision-ms`.
 
 ### Deploy
 
 ```bash
 npx wrangler deploy
-# optional fallback keys:
+
+# Active-tenant registry (production — falls back to seeded in-memory if unset):
+npx wrangler secret put UPSTASH_REDIS_REST_URL
+npx wrangler secret put UPSTASH_REDIS_REST_TOKEN
+
+# Transactional analytics sink (optional):
+npx wrangler secret put ANALYTICS_INGEST_URL
+npx wrangler secret put ANALYTICS_INGEST_TOKEN
+
+# Optional fallback upstream keys:
 npx wrangler secret put OPENAI_API_KEY
 npx wrangler secret put ANTHROPIC_API_KEY
 ```
+
+Tenant records live in Redis as `tenant:<id>` →
+`{"id","name","status","tier"}` and usage counters as
+`usage:<id>:<YYYY-MM>` (auto-expiring monthly).
 
 ---
 

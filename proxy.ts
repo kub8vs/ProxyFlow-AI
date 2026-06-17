@@ -1,28 +1,34 @@
 /**
- * ProxyFlow AI — Edge Proxy Engine
- * ================================
- * Production worker for the Cloudflare Workers / Edge runtime.
+ * ProxyFlow AI — Multi-Tenant Edge Proxy Engine
+ * =============================================
+ * Production worker for the Cloudflare Workers / Edge runtime. Acts as a secure
+ * SaaS billing gateway in front of the LLM providers.
  *
- * Three jobs, executed inline beneath the model layer with no added latency:
+ * Pipeline (per request):
  *
- *   1. SSE STREAMING PASSTHROUGH
- *      Upstream Server-Sent Events are forwarded token-by-token as they arrive.
- *      We pipe the upstream ReadableStream straight through a zero-buffer
- *      TransformStream — every chunk is enqueued the instant it lands, so the
- *      proxy injects no measurable latency into the stream.
+ *   0. ROUTE + TENANCY
+ *      Requests arrive at `/v1/proxy/:tenantId/chat/completions` (or the legacy
+ *      `/v1/p/:tenantId/...` alias). The :tenantId is resolved against the fast
+ *      active-tenant registry (Upstash Redis REST in production, with a seeded
+ *      in-memory fallback for local/dev). Unknown or inactive tenants are
+ *      intercepted before any upstream cost with `402 Payment Required`; tenants
+ *      over their tier's monthly volume get `429 Tier Limit Exhausted`.
  *
- *   2. AGENT LOOP BREAKER  (cryptographic, sliding-window, < 100ms)
- *      Each incoming payload is SHA-256 hashed. We keep a per-client sliding
- *      window of recent hashes and compare consecutive payloads. If an
- *      identical payload repeats beyond threshold inside the window, the
- *      request is terminated with 429 before it ever reaches the upstream —
- *      stopping the infinite-loop spend bleed in single-digit milliseconds.
+ *   1. AGENT LOOP BREAKER  (cryptographic, sliding-window, < 100ms)
+ *      Each payload is SHA-256 hashed; a per-tenant sliding window compares
+ *      consecutive payloads and trips before the upstream is ever called.
  *
- *   3. MODEL INTENT HEADER REWRITING
- *      A fast intent classifier inspects the payload. Low-stakes work is
- *      down-routed to a cheaper sub-model (gpt-4o-mini / claude-haiku-4-5),
- *      the request body `model` field is rewritten, and the correct upstream
- *      auth + version headers are injected dynamically per provider.
+ *   2. MODEL INTENT HEADER REWRITING
+ *      A sub-millisecond classifier down-routes low-stakes work to a cheaper
+ *      sub-model (gpt-4o-mini / claude-haiku-4-5), rewrites the body `model`
+ *      field, and injects the correct upstream auth + version headers.
+ *
+ *   3. SSE STREAMING PASSTHROUGH  (zero added latency)
+ *      Upstream tokens are forwarded the instant they arrive.
+ *
+ *   4. ASYNC DB INSTRUMENTATION
+ *      Usage metering + analytics telemetry are fired through `ctx.waitUntil()`
+ *      so the transactional write never adds a millisecond to the user stream.
  *
  * Deploy:  wrangler deploy   (see wrangler.toml)
  */
@@ -32,18 +38,227 @@
 /* ------------------------------------------------------------------ */
 
 export interface Env {
-  /** Optional fallback OpenAI key if the caller does not supply one. */
+  /** Upstash Redis REST endpoint + token for the active-tenant registry. */
+  UPSTASH_REDIS_REST_URL?: string;
+  UPSTASH_REDIS_REST_TOKEN?: string;
+  /** Transactional analytics sink (HTTPS ingest endpoint + optional token). */
+  ANALYTICS_INGEST_URL?: string;
+  ANALYTICS_INGEST_TOKEN?: string;
+  /** Optional fallback upstream keys if the caller does not supply one. */
   OPENAI_API_KEY?: string;
-  /** Optional fallback Anthropic key if the caller does not supply one. */
   ANTHROPIC_API_KEY?: string;
-  /** Comma-separated list of client IDs allowed to use this proxy (optional). */
-  PROXYFLOW_ALLOWED_CLIENTS?: string;
 }
 
-/* Minimal ExecutionContext shape (Workers runtime provides the real one). */
+/* Minimal ExecutionContext shape (the Workers runtime provides the real one). */
 interface ExecutionContext {
   waitUntil(promise: Promise<unknown>): void;
   passThroughOnException(): void;
+}
+
+/* ------------------------------------------------------------------ */
+/* Tenancy model                                                       */
+/* ------------------------------------------------------------------ */
+
+type Tier = "pro" | "scale" | "enterprise";
+type TenantStatus = "ACTIVE_TENANT" | "PAST_DUE" | "CANCELED" | "TRIALING";
+
+interface TenantRecord {
+  id: string;
+  name: string;
+  status: TenantStatus;
+  tier: Tier;
+}
+
+/**
+ * Monthly optimized-request allowances. These mirror the public pricing tiers
+ * exactly, so the landing-page plans and the edge enforcement never drift.
+ */
+const TIER_REQUEST_LIMITS: Record<Tier, number> = {
+  pro: 50_000,
+  scale: 500_000,
+  enterprise: Number.POSITIVE_INFINITY,
+};
+
+/** Usage keys expire ~40 days out so monthly counters self-reset. */
+const USAGE_TTL_SECONDS = 3_456_000;
+
+interface TenantLookup {
+  tenant: TenantRecord | null;
+  usage: number;
+}
+
+interface TenantRegistry {
+  lookup(tenantId: string, period: string): Promise<TenantLookup>;
+  commitUsage(tenantId: string, period: string, by: number): Promise<void>;
+}
+
+/* ---- Upstash Redis REST registry (production) -------------------- */
+
+async function upstashPipeline(
+  env: Env,
+  commands: (string | number)[][],
+): Promise<unknown[]> {
+  const url = env.UPSTASH_REDIS_REST_URL as string;
+  const token = env.UPSTASH_REDIS_REST_TOKEN as string;
+  const res = await fetch(`${url}/pipeline`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(commands),
+  });
+  if (!res.ok) {
+    throw new Error(`upstash_pipeline_failed_${res.status}`);
+  }
+  const data = (await res.json()) as Array<{ result?: unknown; error?: string }>;
+  return data.map((d) => (d && "result" in d ? d.result ?? null : null));
+}
+
+class UpstashTenantRegistry implements TenantRegistry {
+  constructor(private readonly env: Env) {}
+
+  async lookup(tenantId: string, period: string): Promise<TenantLookup> {
+    const [tenantRaw, usageRaw] = await upstashPipeline(this.env, [
+      ["GET", `tenant:${tenantId}`],
+      ["GET", `usage:${tenantId}:${period}`],
+    ]);
+
+    let tenant: TenantRecord | null = null;
+    if (typeof tenantRaw === "string") {
+      try {
+        tenant = normalizeTenant(JSON.parse(tenantRaw));
+      } catch {
+        tenant = null;
+      }
+    }
+    const usage = typeof usageRaw === "string" ? Number(usageRaw) || 0 : 0;
+    return { tenant, usage };
+  }
+
+  async commitUsage(tenantId: string, period: string, by: number): Promise<void> {
+    await upstashPipeline(this.env, [
+      ["INCRBY", `usage:${tenantId}:${period}`, by],
+      ["EXPIRE", `usage:${tenantId}:${period}`, USAGE_TTL_SECONDS],
+    ]);
+  }
+}
+
+/** Coerce an untrusted registry record into a typed tenant (or null). */
+function normalizeTenant(value: unknown): TenantRecord | null {
+  if (!value || typeof value !== "object") return null;
+  const v = value as Record<string, unknown>;
+  const tier = v.tier;
+  const status = v.status;
+  if (tier !== "pro" && tier !== "scale" && tier !== "enterprise") return null;
+  const validStatus =
+    status === "ACTIVE_TENANT" ||
+    status === "PAST_DUE" ||
+    status === "CANCELED" ||
+    status === "TRIALING";
+  if (!validStatus) return null;
+  return {
+    id: typeof v.id === "string" ? v.id : "",
+    name: typeof v.name === "string" ? v.name : "",
+    status: status as TenantStatus,
+    tier: tier as Tier,
+  };
+}
+
+/* ---- In-memory registry (seeded fallback for local/dev) ---------- */
+
+class MemoryTenantRegistry implements TenantRegistry {
+  private readonly tenants = new Map<string, TenantRecord>();
+  private readonly usage = new Map<string, number>();
+
+  constructor() {
+    const seed: TenantRecord[] = [
+      { id: "demo-pro", name: "Demo Pro", status: "ACTIVE_TENANT", tier: "pro" },
+      { id: "acme-scale", name: "Acme Corp", status: "ACTIVE_TENANT", tier: "scale" },
+      { id: "globex-enterprise", name: "Globex", status: "ACTIVE_TENANT", tier: "enterprise" },
+      { id: "past-due-inc", name: "PastDue Inc", status: "PAST_DUE", tier: "scale" },
+      { id: "maxed-pro", name: "Maxed Pro", status: "ACTIVE_TENANT", tier: "pro" },
+    ];
+    for (const t of seed) this.tenants.set(t.id, t);
+  }
+
+  async lookup(tenantId: string, period: string): Promise<TenantLookup> {
+    // `maxed-pro` is a demo tenant that always reads as exhausted so the 429
+    // tier-limit path is deterministically reproducible in any billing period.
+    if (tenantId === "maxed-pro") {
+      return {
+        tenant: this.tenants.get(tenantId) ?? null,
+        usage: TIER_REQUEST_LIMITS.pro,
+      };
+    }
+    return {
+      tenant: this.tenants.get(tenantId) ?? null,
+      usage: this.usage.get(`${tenantId}:${period}`) ?? 0,
+    };
+  }
+
+  async commitUsage(tenantId: string, period: string, by: number): Promise<void> {
+    const key = `${tenantId}:${period}`;
+    this.usage.set(key, (this.usage.get(key) ?? 0) + by);
+  }
+}
+
+/* Module-scoped singleton: persists across requests within an isolate. */
+let registrySingleton: TenantRegistry | null = null;
+
+function getRegistry(env: Env): TenantRegistry {
+  if (registrySingleton) return registrySingleton;
+  registrySingleton =
+    env.UPSTASH_REDIS_REST_URL && env.UPSTASH_REDIS_REST_TOKEN
+      ? new UpstashTenantRegistry(env)
+      : new MemoryTenantRegistry();
+  return registrySingleton;
+}
+
+/** Current billing period as `YYYY-MM` (UTC). */
+function periodKey(nowMs: number): string {
+  const d = new Date(nowMs);
+  const month = String(d.getUTCMonth() + 1).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${month}`;
+}
+
+/* ------------------------------------------------------------------ */
+/* Analytics — transactional storage (fire-and-forget)                */
+/* ------------------------------------------------------------------ */
+
+interface AnalyticsEvent {
+  event: "proxyflow.request";
+  request_id: string;
+  tenant_id: string;
+  tier: Tier;
+  period: string;
+  provider: Provider;
+  original_model: string;
+  routed_model: string;
+  down_routed: boolean;
+  intent: string;
+  loop_state: string;
+  decision_ms: number;
+  usage_after: number;
+  ts: string;
+}
+
+async function recordAnalytics(env: Env, event: AnalyticsEvent): Promise<void> {
+  if (!env.ANALYTICS_INGEST_URL) return;
+  try {
+    await fetch(env.ANALYTICS_INGEST_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(env.ANALYTICS_INGEST_TOKEN
+          ? { authorization: `Bearer ${env.ANALYTICS_INGEST_TOKEN}` }
+          : {}),
+      },
+      body: JSON.stringify(event),
+    });
+  } catch {
+    /* fire-and-forget: telemetry loss must never affect the request path */
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -55,9 +270,7 @@ type Provider = "openai" | "anthropic";
 interface ProviderConfig {
   baseUrl: string;
   defaultPath: string;
-  /** Models we down-route low-stakes traffic to. */
   cheapModel: string;
-  /** Models considered "expensive" and eligible for down-routing. */
   expensiveModels: string[];
 }
 
@@ -85,10 +298,10 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
 const ANTHROPIC_VERSION = "2023-06-01";
 
 /* Loop-breaker tuning. */
-const LOOP_WINDOW_MS = 10_000; // sliding window span
-const LOOP_REPEAT_THRESHOLD = 6; // identical payloads in window => trip
-const LOOP_CONSECUTIVE_THRESHOLD = 4; // back-to-back identical => trip faster
-const MAX_TRACKED_CLIENTS = 10_000; // memory guard for the in-isolate map
+const LOOP_WINDOW_MS = 10_000;
+const LOOP_REPEAT_THRESHOLD = 6;
+const LOOP_CONSECUTIVE_THRESHOLD = 4;
+const MAX_TRACKED_CLIENTS = 10_000;
 
 /* ------------------------------------------------------------------ */
 /* CORS                                                                */
@@ -106,7 +319,6 @@ const CORS_HEADERS: Record<string, string> = {
 /* Crypto helpers                                                      */
 /* ------------------------------------------------------------------ */
 
-/** SHA-256 hex digest of an arbitrary string. */
 async function sha256Hex(input: string): Promise<string> {
   const data = new TextEncoder().encode(input);
   const digest = await crypto.subtle.digest("SHA-256", data);
@@ -118,7 +330,6 @@ async function sha256Hex(input: string): Promise<string> {
   return hex;
 }
 
-/** Short, stable fingerprint of a secret (never logs the secret itself). */
 async function fingerprint(secret: string): Promise<string> {
   if (!secret) return "anon";
   const h = await sha256Hex(secret);
@@ -141,34 +352,20 @@ interface LoopVerdict {
   consecutive: number;
 }
 
-/**
- * In-isolate sliding-window store. For multi-isolate global consistency,
- * back this with a Durable Object keyed by clientId; the record/evaluate
- * logic is identical. Kept in-memory here for zero-latency, single-file
- * deployment.
- */
 class LoopBreaker {
   private windows = new Map<string, HashEntry[]>();
 
   record(clientId: string, hash: string, now: number): LoopVerdict {
     let entries = this.windows.get(clientId);
     if (!entries) {
-      // Soft cap to keep isolate memory bounded.
-      if (this.windows.size >= MAX_TRACKED_CLIENTS) {
-        this.windows.clear();
-      }
+      if (this.windows.size >= MAX_TRACKED_CLIENTS) this.windows.clear();
       entries = [];
       this.windows.set(clientId, entries);
     }
 
-    // Drop everything outside the sliding window.
     const cutoff = now - LOOP_WINDOW_MS;
-    while (entries.length > 0 && entries[0].ts < cutoff) {
-      entries.shift();
-    }
+    while (entries.length > 0 && entries[0].ts < cutoff) entries.shift();
 
-    // Count identical payloads still inside the window (consecutive payload
-    // hash comparison) and the run of back-to-back identical hashes.
     let repeats = 0;
     let consecutive = 0;
     let runBroken = false;
@@ -182,10 +379,8 @@ class LoopBreaker {
     }
 
     entries.push({ hash, ts: now });
-    // Hard cap on per-client history length.
     if (entries.length > 256) entries.splice(0, entries.length - 256);
 
-    // +1 to include the current request in the tally.
     const totalRepeats = repeats + 1;
     const totalConsecutive = consecutive + 1;
 
@@ -205,16 +400,10 @@ class LoopBreaker {
         consecutive: totalConsecutive,
       };
     }
-    return {
-      tripped: false,
-      reason: "ok",
-      repeats: totalRepeats,
-      consecutive: totalConsecutive,
-    };
+    return { tripped: false, reason: "ok", repeats: totalRepeats, consecutive: totalConsecutive };
   }
 }
 
-// Module-scoped instance: survives across requests within an isolate.
 const loopBreaker = new LoopBreaker();
 
 /* ------------------------------------------------------------------ */
@@ -245,7 +434,6 @@ const LOW_STAKES_KEYWORDS = [
   "language detect",
 ];
 
-/** Detect which upstream a model name belongs to. */
 function providerForModel(model: string): Provider {
   const m = model.toLowerCase();
   if (m.startsWith("claude")) return "anthropic";
@@ -253,7 +441,6 @@ function providerForModel(model: string): Provider {
   return "openai";
 }
 
-/** Pull the user/system text out of an OpenAI- or Anthropic-shaped body. */
 function extractPromptText(json: Record<string, unknown> | null): string {
   if (!json) return "";
   let text = "";
@@ -286,12 +473,10 @@ interface IntentDecision {
   reason: string;
 }
 
-/** Fast (<1ms) heuristic intent classification — the 150ms router's hot path. */
 function classifyIntent(payload: ParsedPayload): IntentDecision {
   const json = payload.json;
   if (!json) return { tier: "high", reason: "unparsed_body" };
 
-  // Explicitly tiny token budgets are a strong low-stakes signal.
   const maxTokens =
     (json["max_tokens"] as number | undefined) ??
     (json["max_completion_tokens"] as number | undefined);
@@ -300,17 +485,13 @@ function classifyIntent(payload: ParsedPayload): IntentDecision {
   }
 
   const text = extractPromptText(json);
-
-  // Short prompts that aren't tool/function flows are low-stakes.
   const hasTools = Boolean(json["tools"] || json["functions"]);
   if (!hasTools && text.length > 0 && text.length < 280) {
     return { tier: "low", reason: `short_prompt(${text.length})` };
   }
 
   for (const kw of LOW_STAKES_KEYWORDS) {
-    if (text.includes(kw)) {
-      return { tier: "low", reason: `keyword(${kw.trim()})` };
-    }
+    if (text.includes(kw)) return { tier: "low", reason: `keyword(${kw.trim()})` };
   }
 
   return { tier: "high", reason: "high_value_default" };
@@ -324,11 +505,9 @@ interface RewriteResult {
   body: string;
 }
 
-/** Rewrite the body `model` field for low-stakes down-routing. */
 function rewriteModel(payload: ParsedPayload, decision: IntentDecision): RewriteResult {
   const cfg = PROVIDERS[payload.provider];
   const original = payload.model;
-
   const isExpensive = cfg.expensiveModels.some((m) =>
     original.toLowerCase().startsWith(m.toLowerCase()),
   );
@@ -357,36 +536,25 @@ function rewriteModel(payload: ParsedPayload, decision: IntentDecision): Rewrite
 /* Request parsing + auth extraction                                  */
 /* ------------------------------------------------------------------ */
 
-/** Extract the upstream API key from any of the accepted header forms. */
 function extractApiKey(request: Request, env: Env, provider: Provider): string {
   const auth = request.headers.get("authorization");
-  if (auth && auth.toLowerCase().startsWith("bearer ")) {
-    return auth.slice(7).trim();
-  }
+  if (auth && auth.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
   const xKey = request.headers.get("x-api-key");
   if (xKey) return xKey.trim();
   const pfKey = request.headers.get("x-proxyflow-key");
   if (pfKey) return pfKey.trim();
-
-  // Fall back to environment-bound keys.
   if (provider === "openai" && env.OPENAI_API_KEY) return env.OPENAI_API_KEY;
   if (provider === "anthropic" && env.ANTHROPIC_API_KEY) return env.ANTHROPIC_API_KEY;
   return "";
 }
 
-/** Build the upstream URL, preserving any sub-path the client appended. */
 function buildUpstreamUrl(provider: Provider, rest: string): string {
   const cfg = PROVIDERS[provider];
-  if (!rest || rest === "/" ) return cfg.baseUrl + cfg.defaultPath;
+  if (!rest || rest === "/") return cfg.baseUrl + cfg.defaultPath;
   if (rest.startsWith("/v1/")) return cfg.baseUrl + rest;
   return cfg.baseUrl + "/v1" + (rest.startsWith("/") ? rest : "/" + rest);
 }
 
-/**
- * Construct upstream headers, dynamically rewriting auth + version per
- * provider. This is the "model intent header rewriting" surface: we strip the
- * client's transport headers and inject exactly what the upstream expects.
- */
 function buildUpstreamHeaders(
   provider: Provider,
   apiKey: string,
@@ -403,12 +571,10 @@ function buildUpstreamHeaders(
     headers.set("authorization", `Bearer ${apiKey}`);
   }
 
-  // Telemetry / observability headers describing the routing decision.
   headers.set("x-proxyflow-routed", rewrite.changed ? "down" : "passthrough");
   headers.set("x-proxyflow-original-model", rewrite.originalModel);
   headers.set("x-proxyflow-routed-model", rewrite.routedModel);
   headers.set("x-proxyflow-intent", rewrite.reason);
-
   return headers;
 }
 
@@ -416,7 +582,11 @@ function buildUpstreamHeaders(
 /* Response helpers                                                    */
 /* ------------------------------------------------------------------ */
 
-function jsonResponse(body: unknown, status: number, extra?: Record<string, string>): Response {
+function jsonResponse(
+  body: unknown,
+  status: number,
+  extra?: Record<string, string>,
+): Response {
   return new Response(JSON.stringify(body, null, 2), {
     status,
     headers: { "content-type": "application/json", ...CORS_HEADERS, ...(extra ?? {}) },
@@ -424,15 +594,13 @@ function jsonResponse(body: unknown, status: number, extra?: Record<string, stri
 }
 
 /**
- * Zero-latency SSE passthrough. Chunks are forwarded the instant they arrive;
- * the transform only taps the stream (optional token counting) without ever
- * holding a chunk back. Telemetry is shipped after the stream closes via
- * ctx.waitUntil so it never delays a token.
+ * Zero-latency SSE passthrough. Each chunk is enqueued the instant it arrives;
+ * the transform only taps the stream for inline token visibility and never
+ * holds a chunk back.
  */
 function streamPassthrough(
   upstream: Response,
   decisionHeaders: Record<string, string>,
-  ctx: ExecutionContext,
 ): Response {
   const body = upstream.body;
   const headers = new Headers(upstream.headers);
@@ -440,27 +608,15 @@ function streamPassthrough(
   for (const [k, v] of Object.entries(decisionHeaders)) headers.set(k, v);
   headers.set("x-proxyflow-streamed", "true");
 
-  if (!body) {
-    return new Response(null, { status: upstream.status, headers });
-  }
+  if (!body) return new Response(null, { status: upstream.status, headers });
 
-  let tokenChunks = 0;
   const tap = new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
-      // Forward immediately — no buffering, no latency.
-      controller.enqueue(chunk);
-      tokenChunks += 1;
-    },
-    flush() {
-      // Best-effort post-stream telemetry; never blocks delivery.
-      ctx.waitUntil(Promise.resolve(tokenChunks));
+      controller.enqueue(chunk); // forward immediately — no buffering, no latency
     },
   });
 
-  return new Response(body.pipeThrough(tap), {
-    status: upstream.status,
-    headers,
-  });
+  return new Response(body.pipeThrough(tap), { status: upstream.status, headers });
 }
 
 /* ------------------------------------------------------------------ */
@@ -475,44 +631,50 @@ async function handleProxy(
   const started = Date.now();
   const url = new URL(request.url);
 
-  // CORS preflight.
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
 
-  // Health / status probe.
   if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
     return jsonResponse(
       {
         service: "proxyflow-edge",
         status: "operational",
         runtime: "cloudflare-workers",
+        registry: registrySingleton instanceof MemoryTenantRegistry ? "memory" : "configured",
         capabilities: [
+          "multi-tenant-billing-gateway",
           "sse-streaming-passthrough",
           "agent-loop-breaker",
           "intent-model-routing",
+          "async-usage-instrumentation",
         ],
+        tier_request_limits: {
+          pro: TIER_REQUEST_LIMITS.pro,
+          scale: TIER_REQUEST_LIMITS.scale,
+          enterprise: "unlimited",
+        },
       },
       200,
     );
   }
 
-  // Route: /v1/p/<clientId>[/<...rest>]
-  const match = url.pathname.match(/^\/v1\/p\/([^/]+)(\/.*)?$/);
+  // Route: /v1/proxy/:tenantId/<rest>  (primary)  or  /v1/p/:tenantId/<rest>  (alias)
+  const match = url.pathname.match(/^\/v1\/(?:proxy|p)\/([^/]+)(\/.*)?$/);
   if (!match) {
     return jsonResponse(
       {
         error: {
           type: "proxyflow_not_found",
           message:
-            "Route not found. Use POST https://api.proxyflow.ai/v1/p/<client-id>/chat/completions",
+            "Route not found. Use POST https://api.proxyflow.ai/v1/proxy/<tenant-id>/chat/completions",
         },
       },
       404,
     );
   }
 
-  const clientId = match[1];
+  const tenantId = match[1];
   const rest = match[2] ?? "";
 
   if (request.method !== "POST") {
@@ -522,18 +684,81 @@ async function handleProxy(
     );
   }
 
-  // Optional allow-list enforcement.
-  if (env.PROXYFLOW_ALLOWED_CLIENTS) {
-    const allowed = env.PROXYFLOW_ALLOWED_CLIENTS.split(",").map((s) => s.trim());
-    if (!allowed.includes(clientId)) {
-      return jsonResponse(
-        { error: { type: "proxyflow_forbidden", message: "Unknown client id." } },
-        403,
-      );
-    }
+  /* ---- 0. Tenancy gate ------------------------------------------- */
+  const period = periodKey(started);
+  const registry = getRegistry(env);
+
+  let lookup: TenantLookup;
+  try {
+    lookup = await registry.lookup(tenantId, period);
+  } catch (err) {
+    return jsonResponse(
+      {
+        error: {
+          type: "proxyflow_registry_unavailable",
+          message: "Tenant registry is temporarily unavailable.",
+          detail: err instanceof Error ? err.message : String(err),
+        },
+      },
+      503,
+      { "retry-after": "2" },
+    );
   }
 
-  // Read the raw body once.
+  const tenant = lookup.tenant;
+  if (!tenant) {
+    return jsonResponse(
+      {
+        error: {
+          type: "payment_required",
+          message: `Tenant '${tenantId}' is not provisioned. Activate a subscription to open this endpoint.`,
+        },
+      },
+      402,
+      { "x-proxyflow-tenant": tenantId, "x-proxyflow-gate": "unknown_tenant" },
+    );
+  }
+
+  if (tenant.status !== "ACTIVE_TENANT") {
+    return jsonResponse(
+      {
+        error: {
+          type: "payment_required",
+          message: `Tenant '${tenantId}' is ${tenant.status}. Update billing to restore access.`,
+          status: tenant.status,
+        },
+      },
+      402,
+      { "x-proxyflow-tenant": tenantId, "x-proxyflow-gate": tenant.status.toLowerCase() },
+    );
+  }
+
+  const limit = TIER_REQUEST_LIMITS[tenant.tier];
+  const usage = lookup.usage;
+  if (Number.isFinite(limit) && usage >= limit) {
+    return jsonResponse(
+      {
+        error: {
+          type: "tier_limit_exhausted",
+          message: `Tenant '${tenantId}' has exhausted the ${tenant.tier} tier limit of ${limit.toLocaleString("en-US")} optimized requests for ${period}. Upgrade to restore throughput.`,
+          tier: tenant.tier,
+          limit,
+          used: usage,
+          period,
+        },
+      },
+      429,
+      {
+        "x-proxyflow-tenant": tenantId,
+        "x-proxyflow-tier": tenant.tier,
+        "x-proxyflow-limit": String(limit),
+        "x-proxyflow-usage": String(usage),
+        "retry-after": "3600",
+      },
+    );
+  }
+
+  /* ---- Parse the request body ------------------------------------ */
   let raw: string;
   try {
     raw = await request.text();
@@ -548,46 +773,14 @@ async function handleProxy(
   try {
     json = raw ? (JSON.parse(raw) as Record<string, unknown>) : null;
   } catch {
-    json = null; // Non-JSON bodies are still forwarded verbatim.
+    json = null;
   }
 
-  const model =
-    json && typeof json["model"] === "string" ? (json["model"] as string) : "";
+  const model = json && typeof json["model"] === "string" ? (json["model"] as string) : "";
   const provider = model ? providerForModel(model) : "openai";
-
   const payload: ParsedPayload = { raw, json, model: model || "unknown", provider };
 
-  /* ---- 2. Agent Loop Breaker (runs first, before any upstream cost) ---- */
   const apiKey = extractApiKey(request, env, provider);
-  const keyFp = await fingerprint(apiKey);
-  // Hash the canonical payload so identical requests collide deterministically.
-  const payloadHash = await sha256Hex(`${provider}:${model}:${raw}`);
-  const loopClientKey = `${clientId}:${keyFp}`;
-  const verdict = loopBreaker.record(loopClientKey, payloadHash, started);
-
-  if (verdict.tripped) {
-    const elapsed = Date.now() - started;
-    return jsonResponse(
-      {
-        error: {
-          type: "proxyflow_loop_breaker",
-          message:
-            "Agent loop detected and terminated by ProxyFlow before reaching the upstream provider. Repeated identical payloads exceeded the safety threshold.",
-          detail: verdict.reason,
-          repeats: verdict.repeats,
-          window_ms: LOOP_WINDOW_MS,
-        },
-      },
-      429,
-      {
-        "x-proxyflow-loop-breaker": "tripped",
-        "x-proxyflow-loop-reason": verdict.reason,
-        "x-proxyflow-decision-ms": String(elapsed),
-        "retry-after": "5",
-      },
-    );
-  }
-
   if (!apiKey) {
     return jsonResponse(
       {
@@ -598,27 +791,61 @@ async function handleProxy(
         },
       },
       401,
+      { "x-proxyflow-tenant": tenantId },
     );
   }
 
-  /* ---- 3. Intent classification + model/header rewriting ---- */
+  /* ---- 1. Agent Loop Breaker ------------------------------------- */
+  const keyFp = await fingerprint(apiKey);
+  const payloadHash = await sha256Hex(`${provider}:${model}:${raw}`);
+  const verdict = loopBreaker.record(`${tenantId}:${keyFp}`, payloadHash, started);
+  if (verdict.tripped) {
+    return jsonResponse(
+      {
+        error: {
+          type: "proxyflow_loop_breaker",
+          message:
+            "Agent loop detected and terminated before reaching the upstream provider. Repeated identical payloads exceeded the safety threshold.",
+          detail: verdict.reason,
+          repeats: verdict.repeats,
+          window_ms: LOOP_WINDOW_MS,
+        },
+      },
+      429,
+      {
+        "x-proxyflow-tenant": tenantId,
+        "x-proxyflow-loop-breaker": "tripped",
+        "x-proxyflow-loop-reason": verdict.reason,
+        "x-proxyflow-decision-ms": String(Date.now() - started),
+        "retry-after": "5",
+      },
+    );
+  }
+
+  /* ---- 2. Intent classification + model/header rewriting --------- */
   const decision = classifyIntent(payload);
   const rewrite = rewriteModel(payload, decision);
   const upstreamUrl = buildUpstreamUrl(provider, rest);
   const upstreamHeaders = buildUpstreamHeaders(provider, apiKey, rewrite);
 
+  const usageAfter = usage + 1;
+  const remaining = Number.isFinite(limit) ? Math.max(0, limit - usageAfter) : -1;
   const decisionMs = Date.now() - started;
   const decisionHeaders: Record<string, string> = {
+    "x-proxyflow-tenant": tenantId,
+    "x-proxyflow-tier": tenant.tier,
+    "x-proxyflow-usage": String(usageAfter),
+    "x-proxyflow-limit": Number.isFinite(limit) ? String(limit) : "unlimited",
+    "x-proxyflow-remaining": remaining < 0 ? "unlimited" : String(remaining),
     "x-proxyflow-routed": rewrite.changed ? "down" : "passthrough",
     "x-proxyflow-original-model": rewrite.originalModel,
     "x-proxyflow-routed-model": rewrite.routedModel,
     "x-proxyflow-intent": rewrite.reason,
     "x-proxyflow-loop-breaker": "clear",
     "x-proxyflow-decision-ms": String(decisionMs),
-    "x-proxyflow-client": clientId,
   };
 
-  /* ---- 1. Forward + SSE streaming passthrough ---- */
+  /* ---- 3. Forward to upstream ------------------------------------ */
   let upstream: Response;
   try {
     upstream = await fetch(upstreamUrl, {
@@ -640,15 +867,38 @@ async function handleProxy(
     );
   }
 
+  /* ---- 4. Async instrumentation (fire-and-forget, zero lag) ------ */
+  const requestId = crypto.randomUUID();
+  decisionHeaders["x-proxyflow-request-id"] = requestId;
+  ctx.waitUntil(
+    (async () => {
+      await registry.commitUsage(tenantId, period, 1);
+      await recordAnalytics(env, {
+        event: "proxyflow.request",
+        request_id: requestId,
+        tenant_id: tenantId,
+        tier: tenant.tier,
+        period,
+        provider,
+        original_model: rewrite.originalModel,
+        routed_model: rewrite.routedModel,
+        down_routed: rewrite.changed,
+        intent: rewrite.reason,
+        loop_state: verdict.reason,
+        decision_ms: decisionMs,
+        usage_after: usageAfter,
+        ts: new Date(started).toISOString(),
+      });
+    })(),
+  );
+
+  /* ---- Stream or forward ----------------------------------------- */
   const contentType = upstream.headers.get("content-type") ?? "";
   const isStream =
     contentType.includes("text/event-stream") || contentType.includes("stream");
 
-  if (isStream) {
-    return streamPassthrough(upstream, decisionHeaders, ctx);
-  }
+  if (isStream) return streamPassthrough(upstream, decisionHeaders);
 
-  // Non-streaming JSON: forward body + decision headers verbatim.
   const headers = new Headers(upstream.headers);
   for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
   for (const [k, v] of Object.entries(decisionHeaders)) headers.set(k, v);

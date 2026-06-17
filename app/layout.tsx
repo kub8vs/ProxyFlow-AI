@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
+import TenantStatusBadge from "./tenant-status";
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://proxyflow.ai"),
@@ -55,6 +56,7 @@ export default function RootLayout({
     <html lang="en">
       <body className="bg-void text-white font-sans tracking-brutal antialiased">
         {children}
+        <TenantStatusBadge />
       </body>
     </html>
   );

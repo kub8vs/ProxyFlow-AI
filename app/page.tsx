@@ -414,7 +414,7 @@ function MicroBanner() {
           <span className="relative inline-flex h-2 w-2 rounded-full bg-cyan-400" />
         </span>
         <p className="text-[11px] font-medium uppercase tracking-[0.2em] text-white/70 sm:text-xs">
-          42 of 50 enterprise production slots claimed
+          42 of 50 enterprise execution slots claimed
           <span className="mx-2 text-white/30">·</span>
           <span className="text-white/90">Q2 2026</span>
         </p>
@@ -1754,8 +1754,8 @@ function ROICalculator({ onCapture }: { onCapture: (prefill: RoiPrefill) => void
   );
   const easedAnnual = useEasedNumber(roi.annualRestored);
 
-  const spendDisplay = spend >= 100000 ? "$100,000+" : formatMoney(spend);
-  const agentsDisplay = agents >= 250 ? "250+" : String(agents);
+  const spendDisplay = formatMoney(spend);
+  const agentsDisplay = String(agents);
 
   return (
     <section id="roi" className="relative z-10 scroll-mt-20 border-t border-white/10">
@@ -1846,7 +1846,7 @@ function ROICalculator({ onCapture }: { onCapture: (prefill: RoiPrefill) => void
                   Guaranteed Annual Restored Capital
                 </p>
                 <p className="mt-4 break-words text-5xl font-black leading-none tracking-brutal sm:text-6xl">
-                  <span className="pf-text-gradient tabular-nums">
+                  <span className="pf-neon-green tabular-nums">
                     {formatMoney(easedAnnual)}
                   </span>
                 </p>

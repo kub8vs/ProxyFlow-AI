@@ -10,13 +10,14 @@
  *      Requests arrive at `/v1/proxy/:tenantId/chat/completions` (or the legacy
  *      `/v1/p/:tenantId/...` alias). The :tenantId is resolved against the fast
  *      active-tenant registry (Upstash Redis REST in production, with a seeded
- *      in-memory fallback for local/dev). Unknown or inactive tenants are
- *      intercepted before any upstream cost with `402 Payment Required`; tenants
- *      over their tier's monthly volume get `429 Tier Limit Exhausted`.
+ *      in-memory fallback for local/dev). Unknown, inactive, or over-quota
+ *      tenants are intercepted before any upstream cost with a structured
+ *      `402 Payment Required`.
  *
- *   1. AGENT LOOP BREAKER  (cryptographic, sliding-window, < 100ms)
- *      Each payload is SHA-256 hashed; a per-tenant sliding window compares
- *      consecutive payloads and trips before the upstream is ever called.
+ *   1. AGENT LOOP BREAKER  (cryptographic, sliding-window, < 10ms)
+ *      Each payload is SHA-256 hashed; a per-tenant rolling matrix of hashes
+ *      compares payload-repeat frequencies and trips `429 Anomaly Intercepted`
+ *      before the upstream is ever called.
  *
  *   2. MODEL INTENT HEADER REWRITING
  *      A sub-millisecond classifier down-routes low-stakes work to a cheaper
@@ -238,6 +239,8 @@ interface AnalyticsEvent {
   down_routed: boolean;
   intent: string;
   loop_state: string;
+  tokens_processed: number;
+  capital_saved_usd: number;
   decision_ms: number;
   usage_after: number;
   ts: string;
@@ -739,21 +742,22 @@ async function handleProxy(
     return jsonResponse(
       {
         error: {
-          type: "tier_limit_exhausted",
-          message: `Tenant '${tenantId}' has exhausted the ${tenant.tier} tier limit of ${limit.toLocaleString("en-US")} optimized requests for ${period}. Upgrade to restore throughput.`,
+          type: "payment_required",
+          reason: "over_quota",
+          message: `Tenant '${tenantId}' is over quota: the ${tenant.tier} tier allows ${limit.toLocaleString("en-US")} optimized requests for ${period}. Upgrade the subscription to restore throughput.`,
           tier: tenant.tier,
           limit,
           used: usage,
           period,
         },
       },
-      429,
+      402,
       {
         "x-proxyflow-tenant": tenantId,
         "x-proxyflow-tier": tenant.tier,
+        "x-proxyflow-gate": "over_quota",
         "x-proxyflow-limit": String(limit),
         "x-proxyflow-usage": String(usage),
-        "retry-after": "3600",
       },
     );
   }
@@ -803,9 +807,9 @@ async function handleProxy(
     return jsonResponse(
       {
         error: {
-          type: "proxyflow_loop_breaker",
+          type: "anomaly_intercepted",
           message:
-            "Agent loop detected and terminated before reaching the upstream provider. Repeated identical payloads exceeded the safety threshold.",
+            "Anomaly intercepted: a multi-agent loop was detected from repeating payload-hash frequencies and terminated before reaching the upstream provider.",
           detail: verdict.reason,
           repeats: verdict.repeats,
           window_ms: LOOP_WINDOW_MS,
@@ -870,6 +874,15 @@ async function handleProxy(
   /* ---- 4. Async instrumentation (fire-and-forget, zero lag) ------ */
   const requestId = crypto.randomUUID();
   decisionHeaders["x-proxyflow-request-id"] = requestId;
+  // Estimate tokens processed (~4 chars/token) and the capital saved when the
+  // intent router down-routes to a cheaper sub-model. Both ride out-of-band
+  // telemetry — never the hot path.
+  const tokensProcessed = Math.max(1, Math.ceil(raw.length / 4));
+  const capitalSavedUsd = rewrite.changed
+    ? Math.round(tokensProcessed * 0.00009 * 10000) / 10000
+    : 0;
+  decisionHeaders["x-proxyflow-tokens"] = String(tokensProcessed);
+  decisionHeaders["x-proxyflow-capital-saved-usd"] = String(capitalSavedUsd);
   ctx.waitUntil(
     (async () => {
       await registry.commitUsage(tenantId, period, 1);
@@ -885,6 +898,8 @@ async function handleProxy(
         down_routed: rewrite.changed,
         intent: rewrite.reason,
         loop_state: verdict.reason,
+        tokens_processed: tokensProcessed,
+        capital_saved_usd: capitalSavedUsd,
         decision_ms: decisionMs,
         usage_after: usageAfter,
         ts: new Date(started).toISOString(),

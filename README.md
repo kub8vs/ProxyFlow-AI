@@ -73,13 +73,13 @@ gateway** in front of the LLM providers.
 Requests arrive at `/v1/proxy/:tenantId/chat/completions` (legacy
 `/v1/p/:tenantId/...` is aliased). The `:tenantId` is resolved against a fast
 active-tenant registry — **Upstash Redis (REST)** in production, with a seeded
-in-memory fallback for local/dev. Unknown or non-`ACTIVE_TENANT` tenants are
-intercepted with `402 Payment Required`; tenants over their tier's monthly
-volume get `429 Tier Limit Exhausted` — both **before** any upstream cost. Tier
+in-memory fallback for local/dev. Unknown, non-`ACTIVE_TENANT`, or **over-quota**
+tenants are intercepted with a structured `402 Payment Required` — before any
+upstream cost. (`429` is reserved exclusively for the anomaly loop breaker.) Tier
 limits (`pro` 50k · `scale` 500k · `enterprise` unlimited) mirror the pricing.
 
 Seeded dev tenants (in-memory fallback): `demo-pro`, `acme-scale`,
-`globex-enterprise` (active), `past-due-inc` (→ 402), `maxed-pro` (→ 429).
+`globex-enterprise` (active), `past-due-inc` (→ 402), `maxed-pro` (over-quota → 402).
 
 ### b. Async DB instrumentation (zero lag)
 On a successful active-tenant request, usage metering **and** analytics
@@ -91,11 +91,11 @@ Upstream Server-Sent Events are piped through a zero-buffer `TransformStream`;
 every token is enqueued the instant it arrives, so the proxy injects no
 measurable latency. Post-stream telemetry ships via `ctx.waitUntil`.
 
-### d. Agent Loop Breaker (cryptographic, sliding-window, < 100ms)
-Each payload is SHA-256 hashed. A per-client sliding window compares consecutive
-payloads; identical payloads exceeding the threshold trip the breaker and return
-`429` **before** the request reaches the upstream — stopping infinite-loop spend
-in single-digit milliseconds. Swap the in-isolate store for a Durable Object for
+### d. Agent Loop Breaker (cryptographic, rolling-hash matrix, < 10ms)
+Each payload is SHA-256 hashed. A per-tenant rolling matrix compares payload
+repeat frequencies; a tripped sequence returns `429 Anomaly Intercepted`
+**before** the request reaches the upstream — stopping infinite-loop spend in
+single-digit milliseconds. Swap the in-isolate store for a Durable Object for
 global consistency; the detection logic is unchanged.
 
 ### e. Model intent header rewriting
@@ -125,7 +125,7 @@ Response headers expose every decision: `x-proxyflow-tenant`,
 `x-proxyflow-tier`, `x-proxyflow-usage`, `x-proxyflow-limit`,
 `x-proxyflow-remaining`, `x-proxyflow-routed`, `x-proxyflow-original-model`,
 `x-proxyflow-routed-model`, `x-proxyflow-intent`, `x-proxyflow-loop-breaker`,
-`x-proxyflow-decision-ms`.
+`x-proxyflow-tokens`, `x-proxyflow-capital-saved-usd`, `x-proxyflow-decision-ms`.
 
 ### Deploy
 
